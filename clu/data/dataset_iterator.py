@@ -19,41 +19,46 @@ several frameworks providing datasets can implement this interface without
 knowing anything about the framework used for the model and the training loop.
 Likewise can training loops assume to get an DatasetIterator object and do not
 need to care about the specifics of the input pipelines.
+
+This modules does not depend on TensorFlow. The interface is generic and users
+don't have to use `tf.data` to construct a DatasetIterator. However, if they
+use `tf.data` they can simply wrap their `tf.data.Dataset` object with
+`TfDatasetIterator` to satisfy the interface.
 """
 from __future__ import annotations
 
 import abc
 import dataclasses
 import functools
-import json
-from typing import Callable, Dict, Optional, Tuple, Union
+import typing
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from etils import epath
 import jax.numpy as jnp  # Just for type checking.
 import numpy as np
-
-# This will be removed once epath provides a pathlib-like API that does not
-# depend on TF.
-from tensorflow.io import gfile
-
-gfile_open = gfile.Open if hasattr(gfile, "Open") else gfile.GFile
 
 DType = np.dtype
 # Sizes of dimensions, None means the dimension size is unknown.
 Shape = Tuple[Optional[int], ...]
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=True)
 class ArraySpec:
   """Describes an array via it's dtype and shape."""
   dtype: DType
   shape: Shape
 
+  def __repr__(self):
+    return f"ArraySpec(dtype={np.dtype(self.dtype).name}, shape={self.shape})"
+
+  def __str__(self):
+    return f"{np.dtype(self.dtype).name}{list(self.shape)}"
+
 
 # Elements are dictionaries with NumPy/JAX arrays.
 Array = Union[np.ndarray, jnp.ndarray]
 Element = Dict[str, Array]
-ElementSpec = Dict[str, ArraySpec]
+ElementSpec = Mapping[str, ArraySpec]
 
 
 class DatasetIterator(abc.ABC):
@@ -77,6 +82,9 @@ class DatasetIterator(abc.ABC):
 
   def __next__(self) -> Element:
     return self.get_next()
+
+  def __iter__(self) -> DatasetIterator:
+    return self
 
   @abc.abstractmethod
   def reset(self):
@@ -113,27 +121,40 @@ class TfDatasetIterator(DatasetIterator):
   """DatasetIterator for wrapping a `tf.data.Dataset`."""
 
   def __init__(self, dataset):
-    # `dataset` must be a tf.data.Dataset object we omit the type annotation
-    # to avoid importing TF for all users of this module.
+    try:
+      if typing.TYPE_CHECKING:
+        tf = Any
+      else:
+        import tensorflow as tf  # pylint: disable=g-import-not-at-top
+    except ImportError as e:
+      raise RuntimeError("When using TfDatasetIterator your binary must "
+                         "depend on //third_party/py/tensorflow.") from e
+    self._tf = tf
+
+    if not isinstance(dataset, tf.data.Dataset):
+      raise ValueError("`dataset` must be an instance of `tf.data.Dataset` "
+                       f"but got {type(dataset)}.")
     self._dataset = dataset
     assert self.element_spec  # Verify element spec.
     self.iterator = iter(dataset)
+    self._ckpt = tf.train.Checkpoint(ds=self.iterator)
 
   def get_next(self) -> Element:
     return {k: np.asarray(v) for k, v in next(self.iterator).items()}
 
   def reset(self):
     self.iterator = iter(self._dataset)
+    self._ckpt = self._tf.train.Checkpoint(ds=self.iterator)
 
   @functools.cached_property
   def element_spec(self) -> ElementSpec:
-    import tensorflow as tf  # pylint: disable=g-import-not-at-top
     element_spec = self._dataset.element_spec
     if not isinstance(element_spec, dict):
       raise ValueError("Dataset elements must be flat dictionaries but got "
                        f"{element_spec}.")
     invalid_features = [
-        k for k, v in element_spec.items() if not isinstance(v, tf.TensorSpec)
+        k for k, v in element_spec.items()
+        if not isinstance(v, self._tf.TensorSpec)
     ]
     if invalid_features:
       raise ValueError(f"Features {invalid_features} are not tensors. Dataset "
@@ -144,49 +165,7 @@ class TfDatasetIterator(DatasetIterator):
     }
 
   def save(self, filename: epath.PathLike):
-    import tensorflow as tf  # pylint: disable=g-import-not-at-top
-    ckpt = tf.train.Checkpoint(ds=self.iterator)
-    ckpt.write(str(filename))
+    self._ckpt.write(str(filename))
 
   def load(self, filename: epath.PathLike):
-    import tensorflow as tf  # pylint: disable=g-import-not-at-top
-    ckpt = tf.train.Checkpoint(ds=self.iterator)
-    ckpt.read(str(filename)).assert_consumed()
-
-
-INDEX = "index"
-
-
-class IndexBasedDatasetIterator(DatasetIterator):
-  """Checkpointable iterator that restores state based on the last seen index.
-
-  This iterator enables deterministic input pipelines without materialising the
-  dataset by keeping track of the last seen "index". See go/preemptable-tf-data.
-  """
-
-  def __init__(self, start_index_to_iterator: Callable[[int], DatasetIterator]):
-    self._start_index_to_iterator = start_index_to_iterator
-    self._iterator = self._start_index_to_iterator(0)
-
-  def get_next(self) -> Element:
-    element = self._iterator.get_next()
-    self._last_seen_index = element[INDEX].max().item()
-    return element
-
-  def reset(self):
-    self._last_seen_index = -1
-    self._iterator = self._start_index_to_iterator(0)
-
-  @property
-  def element_spec(self) -> ElementSpec:
-    return self._iterator.element_spec
-
-  def save(self, filename: epath.PathLike):
-    ckpt = {"last_seen_index": self._last_seen_index}
-    with gfile_open(str(filename), "w") as f:
-      json.dump(ckpt, f)
-
-  def load(self, filename: epath.PathLike):
-    with gfile_open(str(filename)) as f:
-      self._last_seen_index = json.load(f)["last_seen_index"]
-    self._iterator = self._start_index_to_iterator(self._last_seen_index + 1)
+    self._ckpt.read(str(filename)).assert_consumed()
