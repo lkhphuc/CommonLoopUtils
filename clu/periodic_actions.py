@@ -18,6 +18,7 @@ import abc
 import collections
 import concurrent.futures
 import contextlib
+import os
 import queue
 import time
 from typing import Callable, Iterable, Optional, Sequence
@@ -28,6 +29,7 @@ from clu import metric_writers
 from clu import platform
 from clu import profiler
 
+from etils import epath
 import jax
 import jax.numpy as jnp
 
@@ -138,14 +140,14 @@ class PeriodicAction(abc.ABC):
 
     Args:
       step: Current step.
-      t: Optional timestamp. Will use `time.time()` if not specified.
+      t: Optional timestamp. Will use `time.monotonic()` if not specified.
 
     Returns:
       True if the action triggered, False otherwise. Note that the first
       invocation never triggers.
     """
     if t is None:
-      t = time.time()
+      t = time.monotonic()
 
     self._init_and_check(step, t)
     if self._should_trigger(step, t):
@@ -171,9 +173,11 @@ class ReportProgress(PeriodicAction):
                on_steps: Optional[Iterable[int]] = None):
     """Creates a new ReportProgress hook.
 
-    Warning: The progress and the reported steps_per_sec are estimates. We
-    ignore the asynchronous dispatch for JAX and other operations in the
-    training loop (e.g. evaluation).
+    Reports progress summary via `platform.work_unit().set_notes()`, and logs
+    some additional metrics:
+
+    - "uptime": secs since program start
+    - "steps_per_sec": point esitmate of steps/sec
 
     Args:
       num_train_steps: The total number of training steps for training.
@@ -195,7 +199,7 @@ class ReportProgress(PeriodicAction):
     self._writer = writer
     self._waiting_for_part = collections.defaultdict(queue.Queue)
     self._time_per_part = collections.defaultdict(float)
-    self._t0 = time.time()
+    self._t0 = time.monotonic()
     # Using max_worker=1 guarantees that the calls to _wait_jax_async_dispatch()
     # happen sequentially.
     self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -213,7 +217,7 @@ class ReportProgress(PeriodicAction):
                   f"({step}/{self._num_train_steps}), "
                   f"ETA: {_format_secs(eta_seconds)}")
     if self._time_per_part:
-      total = time.time() - self._t0
+      total = time.monotonic() - self._t0
       message += " ({} : {})".format(_format_secs(total), ", ".join(
           f"{100 * dt / total:.1f}% {name}"
           for name, dt in sorted(self._time_per_part.items())))
@@ -221,6 +225,7 @@ class ReportProgress(PeriodicAction):
     platform.work_unit().set_notes(message)
     if self._writer is not None:
       self._writer.write_scalars(step, {"steps_per_sec": steps_per_sec})
+      self._writer.write_scalars(step, {"uptime": time.monotonic() - self._t0})
 
   @contextlib.contextmanager
   def timed(self, name: str, wait_jax_async_dispatch: bool = True):
@@ -241,7 +246,7 @@ class ReportProgress(PeriodicAction):
             evaluate()
 
     The above example would result in the progress being reported as something
-    like "10% @1000 ... (5 min : 10% eval)" - assuming that evaluation takes 10%
+    like "20% @2000 ... (5 min : 10% eval)" - assuming that evaluation takes 10%
     of the entire time in this case.
 
     Args:
@@ -267,7 +272,7 @@ class ReportProgress(PeriodicAction):
     def start_measurement():
       if wait_jax_async_dispatch:
         _wait_jax_async_dispatch()
-      self._waiting_for_part[name].put(time.time())
+      self._waiting_for_part[name].put(time.monotonic())
     self._executor.submit(start_measurement)
 
     yield
@@ -275,7 +280,7 @@ class ReportProgress(PeriodicAction):
     def stop_measurement():
       if wait_jax_async_dispatch:
         _wait_jax_async_dispatch()
-      dt = time.time() - self._waiting_for_part[name].get()
+      dt = time.monotonic() - self._waiting_for_part[name].get()
       self._time_per_part[name] += dt
     self._executor.submit(stop_measurement)
 
@@ -285,16 +290,17 @@ class Profile(PeriodicAction):
 
   """
 
-  def __init__(self,
-               *,
-               logdir: str,
-               num_profile_steps: Optional[int] = 5,
-               profile_duration_ms: Optional[int] = 3_000,
-               first_profile: int = 10,
-               every_steps: Optional[int] = None,
-               every_secs: Optional[float] = 3600.0,
-               artifact_name: str = "[{step}] Profile",
-               ):
+  def __init__(
+      self,
+      *,
+      logdir: epath.PathLike,
+      num_profile_steps: Optional[int] = 5,
+      profile_duration_ms: Optional[int] = 3_000,
+      first_profile: int = 10,
+      every_steps: Optional[int] = None,
+      every_secs: Optional[float] = 3600.0,
+      artifact_name: str = "[{step}] Profile",
+  ):
     """Initializes a new periodic profiler action.
 
     Args:
@@ -318,7 +324,7 @@ class Profile(PeriodicAction):
     self._profile_duration_ms = profile_duration_ms
     self._session_running = False
     self._session_started = None
-    self._logdir = logdir
+    self._logdir = os.fspath(logdir)
     self._artifact_name = artifact_name
 
   def _should_trigger(self, step: int, t: float) -> bool:
@@ -343,7 +349,7 @@ class Profile(PeriodicAction):
     try:
       profiler.start(logdir=self._logdir)
       self._session_running = True
-      self._session_started = time.time()
+      self._session_started = time.monotonic()
     except Exception as e:  # pylint: disable=broad-except
       logging.exception("Could not start profiling: %s", e)
 
@@ -442,7 +448,7 @@ class PeriodicCallback(PeriodicAction):
 
   def __call__(self, step: int, t: Optional[float] = None, **kwargs) -> bool:
     if t is None:
-      t = time.time()
+      t = time.monotonic()
 
     self._init_and_check(step, t)
     if self._should_trigger(step, t):
